@@ -226,6 +226,64 @@ npm run build
    - 构建命令：`npm run build` 默认即可。
    - 高级配置/环境变量：`KV_NAMESPACE` 你KV存储的名称 `JWT_SECRET` 随机英文字符20位左右即可。
 
+###OpenListNext → Cloudflare Workers 完整部署（Github Actions）
+使用项目自带工作流：.github/workflows/deploy‑workers.yml，不要新建自定义 workflow
+1、Cloudflare 后台提前准备
+① 获取账号 ID
+CF 控制台右下角复制：CF_ACCOUNT_ID
+② 创建 API Token（关键）
+https://dash.cloudflare.com/profile/api-tokens
+创建自定义令牌
+权限：
+Workers Scripts：编辑
+Workers KV：编辑
+Account Settings：读取
+复制生成的 token → CF_API_TOKEN
+③ 创建 KV 命名空间（必须！项目存配置、账号、分享链接）
+Cloudflare 控制台 → Workers & Pages → KV → 创建命名空间名字随便，例如：oplistnext-kv复制这个 KV 的ID，后面填到wrangler.toml
+⚠️ Workers 免费版 KV 每日写限制 1000 次，普通使用够用；大量分享操作会耗尽配额。
+④ 修改项目内 wrangler.toml
+打开仓库根目录wrangler.toml
+toml
+name = "oplistnext"
+main = "dist/index.js"
+compatibility_date = "2026-08-01"
+compatibility_flags = ["nodejs_compat"]
+
+[[
+kv_namespaces
+]]
+binding = "OPLIST_KV"
+id = "这里粘贴你刚刚创建KV的ID"
+把id替换为你的 KV ID，提交到 github。
+2、Github 仓库配置 Secrets
+仓库 → Settings → Secrets and variables → Actions → New repository secret添加 2 个 Secret：
+CF_ACCOUNT_ID：粘贴你的 Cloudflare 账号 ID
+CF_API_TOKEN：粘贴刚刚生成的 API Token
+名字必须完全一致，大小写不能错。
+3、启用自带工作流
+你的 fork 仓库页面，点 Actions
+在左侧列表找到：Deploy to Cloudflare Workers（对应文件.github/workflows/deploy‑workers.yml）
+点击 Enable workflow 启用
+触发方式两种：
+往 main 分支 push 代码，自动部署
+点 Run workflow，手动触发部署
+4、部署完成访问
+部署成功后，workers 地址：oplistnext.xxx.workers.dev
+默认账号：admin，默认密码：admin，登录立刻修改密码！
+常见踩坑
+❌报错 KV namespace not found：wrangler.toml 里面 KV ID 复制错，或者没创建 KV
+❌403 权限：API Token 权限不全，确认 Workers、KV 是编辑权限
+❌构建失败：不要修改 workflow，直接使用项目原生 deploy‑workers.yml
+❌登录配置不保存：确认 KV 绑定正确，workers 环境必须依赖 KV 存储，不能用本地 db.json
+备选：本地 wrangler 部署（不通过 Github Action）
+如果你不想用 github actions，本地执行：
+bash
+pnpm install
+pnpm build
+wrangler deploy
+
+
 ## 🔗 原版项目
 
 OpenListNext 是以下项目的分支 / 衍生实现：
