@@ -17,6 +17,7 @@ OpenListNext 是 [OpenList](https://github.com/OpenListTeam/OpenList) 的定制�
 <a href="https://github.com/lie-jiu"><img src="https://github.com/lie-jiu.png" width="48" height="48" alt="lie-jiu (烈酒)" style="border-radius: 50%; margin: 2px;" title="lie-jiu (烈酒)" /></a>
 <a href="https://github.com/Astroptis"><img src="https://github.com/Astroptis.png" width="48" height="48" alt="Astroptis" style="border-radius: 50%; margin: 2px;" title="Astroptis" /></a>
 <a href="https://github.com/BAJJDY"><img src="https://github.com/BAJJDY.png" width="48" height="48" alt="BAJJDY" style="border-radius: 50%; margin: 2px;" title="BAJJDY" /></a>
+<a href="https://github.com/jinenge"><img src="https://github.com/jinenge.png" width="48" height="48" alt="jinenge" style="border-radius: 50%; margin: 2px;" title="jinenge" /></a>
 <a href="https://github.com/chenyimaio"><img src="https://github.com/chenyimaio.png" width="48" height="48" alt="chenyimaio" style="border-radius: 50%; margin: 2px;" title="chenyimaio" /></a>
 
 <br/><br/>
