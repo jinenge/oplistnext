@@ -1,0 +1,23 @@
+name = "openlistnextpro"
+main = "src/backend/worker.ts"
+compatibility_date = "2026-08-04"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = false
+preview_urls = false
+
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+
+[vars]
+ENVIRONMENT = "production"
+VITE_API_URL = "/api"
+R2_PUBLIC_DOMAIN = "pub-14f0a3253e45453eb37b90d19fe8649e.r2.dev"
+
+[[kv_namespaces]]
+binding = "OPENLISTNEXT_KV"
+
+[[r2_buckets]]
+binding = "OPENLISTNEXT_R2"
+bucket_name = "openlist"
+preview_bucket_name = ""
