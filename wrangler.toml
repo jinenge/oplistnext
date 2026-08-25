@@ -20,4 +20,3 @@ binding = "OPENLISTNEXT_KV"
 [[r2_buckets]]
 binding = "OPENLISTNEXT_R2"
 bucket_name = "openlist"
-preview_bucket_name = ""
