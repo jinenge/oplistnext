@@ -1,0 +1,381 @@
+import { Hono } from "hono"
+import { resolvePath } from "../internal/model/db"
+import { parseRangeHeader } from "../internal/stream/stream"
+import { flushPendingDriverState, getDriver } from "../internal/op/storage"
+import { resolveShare } from "../internal/op/share"
+import { getUserFromContext } from "./middlewares"
+import { getSignPolicy, verifyDownloadSign } from "../pkg/sign"
+import { safeErrorMessage } from "../pkg/errs"
+import { assertSafeUrl } from "../pkg/http"
+
+let fsPromises: any = null
+let createReadStream: any = null
+
+async function initNodeModules() {
+  if (
+    typeof process !== "undefined" &&
+    process.release?.name === "node" &&
+    !fsPromises
+  ) {
+    try {
+      fsPromises = await import("fs/promises")
+      createReadStream = (await import("fs")).createReadStream
+    } catch (e) {}
+  }
+}
+
+export const rawRouter = new Hono()
+
+const getStorageRequestContext = (c: any) => {
+  try {
+    const executionCtx = c.executionCtx
+    if (!executionCtx || typeof executionCtx.waitUntil !== "function") {
+      return undefined
+    }
+    return {
+      waitUntil: (promise: Promise<unknown>) => executionCtx.waitUntil(promise),
+    }
+  } catch {
+    return undefined
+  }
+}
+
+rawRouter.get("/*", async (c) => {
+  await initNodeModules()
+
+  const isProxy =
+    c.req.query("proxy") === "true" ||
+    c.req.path.startsWith("/p") ||
+    c.req.path.startsWith("/api/p") ||
+    c.req.path.startsWith("/sd") ||
+    c.req.path.startsWith("/api/sd")
+
+  const rawPath = c.req.path
+    .replace(/^\/api\/raw/, "")
+    .replace(/^\/api\/d/, "")
+    .replace(/^\/api\/sd/, "")
+    .replace(/^\/api\/p/, "")
+    .replace(/^\/raw/, "")
+    .replace(/^\/d/, "")
+    .replace(/^\/sd/, "")
+    .replace(/^\/p/, "")
+
+  const reqPath0 = decodeURIComponent(rawPath)
+
+  try {
+    let reqPath = reqPath0
+    // Share download: /sd/{shareId}/... — map to the real storage path
+    const isSharePath =
+      c.req.path.startsWith("/api/sd") || c.req.path.startsWith("/sd")
+    if (isSharePath) {
+      const shareRes = await resolveShare(
+        reqPath,
+        c.req.query("pwd") || "",
+        c.env,
+      )
+      if (!shareRes.ok) {
+        return c.text(shareRes.error || "分享不存在", 404)
+      }
+      if (shareRes.virtualList || !shareRes.realPath) {
+        return c.text("无法下载分享根目录", 400)
+      }
+      reqPath = shareRes.realPath
+    } else {
+      const user = await getUserFromContext(c)
+      if (!user || user.disabled) {
+        return c.text("Unauthorized", 401)
+      }
+    }
+
+    // 下载签名校验（sign_all / link_expiration 启用时）：
+    // 非分享路径必须携带有效签名，防止下载链接被无限期转发/盗链。
+    if (!isSharePath) {
+      const signPolicy = await getSignPolicy(c)
+      if (signPolicy.enabled) {
+        const sign = c.req.query("sign") || ""
+        const ok = await verifyDownloadSign(c, reqPath, sign)
+        if (!ok) {
+          return c.text("Invalid or expired sign", 401)
+        }
+      }
+    }
+
+    const resolved = await resolvePath(reqPath)
+
+    if (resolved.isVirtual || !resolved.physical) {
+      return c.text("无法下载虚拟目录路径", 400)
+    }
+
+    if (resolved.storage) {
+      const normDriver = (resolved.storage.driver || "")
+        .toLowerCase()
+        .replace(/[^a-z0-9]/g, "")
+
+      // Remote cloud drivers: fetch download link via driver.get()
+      if (normDriver !== "local") {
+        try {
+          const driver = await getDriver(
+            resolved.storage.driver,
+            resolved.storage,
+          )
+          let fileItem
+          try {
+            fileItem = await driver.get(reqPath, resolved.physical)
+          } finally {
+            await flushPendingDriverState(
+              resolved.storage.driver,
+              resolved.storage,
+              driver,
+              getStorageRequestContext(c),
+            )
+          }
+
+          if (fileItem && fileItem.raw_url) {
+            // WebDAV 等需要认证的驱动：强制使用代理模式，避免重定向导致认证丢失
+            const needsProxy =
+              isProxy ||
+              normDriver === "webdav" ||
+              normDriver === "sharepoint" ||
+              normDriver === "onedrive" ||
+              normDriver === "onedriveapp" ||
+              normDriver === "weiyun" ||
+              normDriver === "tencentweiyun"
+            if (needsProxy) {
+              console.log(
+                `[rawRouter] Proxying download for '${reqPath}' via ${resolved.storage.driver}`,
+              )
+              // Start with driver-provided headers (Cookie, Referer, etc.)
+              const headers: Record<string, string> = {
+                ...(fileItem.raw_url_headers || {}),
+              }
+              // Ensure a User-Agent is set (don't override if driver already set one)
+              if (!headers["User-Agent"]) {
+                headers["User-Agent"] =
+                  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+              }
+              // Forward Range header for video/audio/PDF seeking
+              const rangeReq = c.req.header("Range")
+              if (rangeReq) headers["Range"] = rangeReq
+
+              try {
+                assertSafeUrl(fileItem.raw_url, "Proxy download")
+              } catch (ssrfErr: any) {
+                return c.text(ssrfErr.message || "SSRF blocked", 403)
+              }
+
+              let upstreamRes = await fetch(fileItem.raw_url, { headers })
+
+              // If upstream returns 412 Precondition Failed (e.g. strict OSS check), retry with plain GET without Range
+              if (upstreamRes.status === 412) {
+                console.warn(
+                  `[rawRouter] Upstream returned 412 for '${reqPath}', retrying without Range header...`,
+                )
+                delete headers["Range"]
+                upstreamRes = await fetch(fileItem.raw_url, { headers })
+              }
+
+              // CORS headers — same-origin only (no wildcard)
+              c.header("Access-Control-Allow-Methods", "GET, OPTIONS, HEAD")
+              c.header(
+                "Access-Control-Expose-Headers",
+                "Content-Range, Accept-Ranges, Content-Length, Content-Disposition",
+              )
+
+              // Content-Type: prefer upstream, fallback by extension
+              const extMap: Record<string, string> = {
+                pdf: "application/pdf",
+                mp4: "video/mp4",
+                webm: "video/webm",
+                mkv: "video/x-matroska",
+                mp3: "audio/mpeg",
+                flac: "audio/flac",
+                m3u8: "application/vnd.apple.mpegurl",
+                ts: "video/mp2t",
+                png: "image/png",
+                jpg: "image/jpeg",
+                jpeg: "image/jpeg",
+                gif: "image/gif",
+                webp: "image/webp",
+                svg: "image/svg+xml",
+              }
+              const fileExt = reqPath.split(".").pop()?.toLowerCase() || ""
+              const defaultContentType =
+                extMap[fileExt] || "application/octet-stream"
+              c.header(
+                "Content-Type",
+                upstreamRes.headers.get("content-type") || defaultContentType,
+              )
+
+              // Forward range/length headers
+              const contentLength = upstreamRes.headers.get("content-length")
+              if (contentLength) c.header("Content-Length", contentLength)
+              const contentRange = upstreamRes.headers.get("content-range")
+              if (contentRange) c.header("Content-Range", contentRange)
+              // Always advertise range support so video/audio players can seek
+              c.header(
+                "Accept-Ranges",
+                upstreamRes.headers.get("accept-ranges") || "bytes",
+              )
+
+              // Forward caching headers
+              const etag = upstreamRes.headers.get("etag")
+              if (etag) c.header("ETag", etag)
+              const lastModified = upstreamRes.headers.get("last-modified")
+              if (lastModified) c.header("Last-Modified", lastModified)
+              const cacheControl = upstreamRes.headers.get("cache-control")
+              if (cacheControl) c.header("Cache-Control", cacheControl)
+              const contentDisposition = upstreamRes.headers.get(
+                "content-disposition",
+              )
+              if (contentDisposition)
+                c.header("Content-Disposition", contentDisposition)
+
+              return c.body(upstreamRes.body as any, upstreamRes.status as any)
+            } else {
+              try {
+                assertSafeUrl(fileItem.raw_url, "Redirect download")
+              } catch (ssrfErr: any) {
+                return c.text(ssrfErr.message || "SSRF blocked", 403)
+              }
+              console.log(
+                `[rawRouter] Redirecting download for '${reqPath}' via ${resolved.storage.driver}`,
+              )
+              return c.redirect(fileItem.raw_url, 302)
+            }
+          } else if (
+            typeof (driver as any).createReadStream === "function" &&
+            fileItem &&
+            !fileItem.is_dir
+          ) {
+            c.header("Access-Control-Allow-Origin", "*")
+            const size = fileItem.size || 0
+            const rangeHeader = c.req.header("Range")
+            if (rangeHeader && size > 0) {
+              const { start, end, chunksize } = parseRangeHeader(
+                rangeHeader,
+                size,
+              )
+              const stream = await (driver as any).createReadStream(
+                resolved.physical,
+                { start, end },
+              )
+              c.header("Content-Range", `bytes ${start}-${end}/${size}`)
+              c.header("Accept-Ranges", "bytes")
+              c.header("Content-Length", chunksize.toString())
+              c.header("Content-Type", "application/octet-stream")
+              return c.body(stream as any, 206)
+            } else {
+              if (size > 0) c.header("Content-Length", size.toString())
+              c.header("Accept-Ranges", "bytes")
+              c.header("Content-Type", "application/octet-stream")
+              const stream = await (driver as any).createReadStream(
+                resolved.physical,
+              )
+              return c.body(stream as any)
+            }
+          } else if (typeof (driver as any).getFileStream === "function") {
+            const rangeReq = c.req.header("Range")
+            const stream = await (driver as any).getFileStream(
+              reqPath,
+              resolved.physical,
+              rangeReq,
+            )
+            if (stream) {
+              console.log(
+                `[rawRouter] Streaming download for '${reqPath}' via ${resolved.storage.driver}, content-type=${stream.headers["content-type"]}, content-length=${stream.headers["content-length"]}`,
+              )
+              const fileExt = reqPath.split(".").pop()?.toLowerCase() || ""
+              // For text-like types, force application/octet-stream to ensure download
+              const inlineTypes = [
+                "json",
+                "xml",
+                "html",
+                "htm",
+                "txt",
+                "js",
+                "css",
+                "csv",
+                "md",
+              ]
+              const isInline = inlineTypes.includes(fileExt)
+              const contentType = isInline
+                ? "application/octet-stream"
+                : stream.headers["content-type"] || "application/octet-stream"
+              c.header("Content-Type", contentType)
+              if (stream.headers["content-length"])
+                c.header("Content-Length", stream.headers["content-length"])
+              const contentRange = stream.headers["content-range"]
+              if (contentRange) c.header("Content-Range", contentRange)
+              c.header(
+                "Accept-Ranges",
+                stream.headers["accept-ranges"] || "bytes",
+              )
+              if (stream.headers["etag"])
+                c.header("ETag", stream.headers["etag"])
+              if (stream.headers["last-modified"])
+                c.header("Last-Modified", stream.headers["last-modified"])
+              // Force download — prevent browser from rendering JSON/XML/HTML inline
+              const fileName = reqPath.split("/").pop() || "download"
+              c.header(
+                "Content-Disposition",
+                `attachment; filename*=UTF-8''${encodeURIComponent(fileName)}`,
+              )
+              return c.body(stream.body as any)
+            }
+            console.warn(
+              `[rawRouter] getFileStream returned null for '${reqPath}'`,
+            )
+            return c.text("下载失败: 无法获取对象数据流", 500)
+          } else {
+            const detail =
+              fileItem?.raw_url_error ||
+              (fileItem?.is_dir
+                ? "该条目是文件夹，不可作为文件下载。"
+                : "该存储驱动未返回下载链接（raw_url 为空）。")
+            return c.text(
+              `File not found or no download link available: ${reqPath}\n${detail}`,
+              404,
+            )
+          }
+        } catch (e: any) {
+          console.error(
+            `[rawRouter] Driver get failed for '${reqPath}':`,
+            e.message,
+          )
+          return c.text(`Download failed: ${safeErrorMessage(e)}`, 500)
+        }
+      }
+    }
+
+    // Fallback: Local file system streaming
+    if (!fsPromises || !createReadStream) {
+      return c.text("边缘运行时环境不支持本地文件流式传输", 500)
+    }
+
+    const stat = await fsPromises.stat(resolved.physical)
+    if (stat.isDirectory()) {
+      return c.text("无法下载目录", 400)
+    }
+
+    c.header("Accept-Ranges", "bytes")
+    const rangeHeader = c.req.header("Range")
+    if (rangeHeader) {
+      const { start, end, chunksize } = parseRangeHeader(rangeHeader, stat.size)
+      const stream = createReadStream(resolved.physical, { start, end })
+
+      c.header("Content-Range", `bytes ${start}-${end}/${stat.size}`)
+      c.header("Accept-Ranges", "bytes")
+      c.header("Content-Length", chunksize.toString())
+      c.header("Content-Type", "application/octet-stream")
+      return c.body(stream as any, 206)
+    } else {
+      c.header("Content-Length", stat.size.toString())
+      c.header("Accept-Ranges", "bytes")
+      const stream = createReadStream(resolved.physical)
+      return c.body(stream as any)
+    }
+  } catch (err: any) {
+    console.error(`[rawRouter] Download 404 for '${reqPath0}':`, err.message)
+    return c.text(`Not found: ${safeErrorMessage(err, "file not found")}`, 404)
+  }
+})
