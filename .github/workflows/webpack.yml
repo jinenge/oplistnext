@@ -22,7 +22,6 @@ jobs:
       - name: Webpack build
         run: npx webpack
 
-      # 重点：调用 wrangler-action 部署 worker，读取仓库里正确的 wrangler.toml
       - name: Deploy to Cloudflare Worker
         uses: cloudflare/wrangler-action@v4
         with:
